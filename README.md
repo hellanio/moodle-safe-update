@@ -1,269 +1,159 @@
 # moodle-safe-update
 
-Script de atualização automatizada do Moodle (rodando em Docker Compose) com
-backup automático, verificação de integridade de plugins e parada segura em
-caso de falha. Feito para rodar via cron em produção sem supervisão.
+Atualização segura do Moodle 5.x rodando em Docker Compose, com pré-voo antes
+de tirar o site do ar, backup completo com manifesto, rollback de um comando e
+conferências depois do upgrade.
+
+**Versão 2 (2026-09-19).** Reescrita depois do primeiro uso real, que levou um
+laboratório de 5.1.5+ para 5.1.7 e mostrou sete problemas na versão 1 (ver
+[Lições do primeiro uso](#lições-do-primeiro-uso-real)). A v1 falhava antes de
+trocar uma linha de código e deixava o site em manutenção.
 
 ## Por que este script existe
 
-O Moodle **não tem um botão de "atualizar agora" para o core**, ao contrário
-de sistemas como WordPress. Isso é proposital: dar ao processo do servidor
-web (`www-data`) permissão de escrita sobre o próprio código PHP que ele está
-executando é a mesma superfície de ataque que um webshell explora — se algum
-dia existir uma vulnerabilidade de upload/injeção, ela vira execução remota
-de código permanente. Por isso o Moodle core só é atualizado trocando os
-arquivos "por fora" (git, ou baixando um pacote) com um usuário que **não**
-seja o do servidor web, e depois rodando a migração de banco
-(`admin/cli/upgrade.php`).
+O Moodle **não tem botão de "atualizar agora" para o core**, de propósito:
+dar ao servidor web permissão de escrita sobre o próprio código que ele
+executa é a superfície que um webshell explora. O core é trocado "por fora"
+(git ou pacote) e depois roda a migração de banco (`admin/cli/upgrade.php`).
+Este script faz esse fluxo com as proteções que uma atualização às pressas
+costuma pular.
 
-Esse script automatiza exatamente esse fluxo, com as proteções que uma
-atualização manual às pressas normalmente pula:
+## Comandos
 
-1. Liga o **modo de manutenção** (usuários comuns não acessam o site durante a atualização)
-2. **Backup do banco** (`pg_dump` comprimido)
-3. **Backup do código** (`tar.gz` de `code/public/`, do jeito que estava *antes* da atualização)
-4. `git fetch` + `git pull --ff-only` (modo `minor`) **ou** troca de branch (modo `major`, só quando pedido explicitamente — nunca automático)
-5. `composer install` (só reinstala se o `composer.lock` mudou)
-6. `admin/cli/upgrade.php --non-interactive` (migração de banco)
-7. Limpeza de caches
-8. Confere se plugins marcados como "sensíveis" (ver [Customização](#customização)) não foram sobrescritos pela atualização do core
-9. Desliga o modo de manutenção
+```bash
+./update-moodle.sh check [--to v5.1.7]     # pré-voo: não mexe no site nem no código em uso
+./update-moodle.sh minor [--to v5.1.7]     # atualiza dentro da mesma linha (5.1.x)
+./update-moodle.sh major MOODLE_502_STABLE # troca de versão maior
+./update-moodle.sh rollback backups/manifest-<versão>-<data>.env
+```
 
-**Em qualquer etapa que falhar, o script para imediatamente**, mantém o modo
-de manutenção ativo (site protegido, não fica servindo uma versão quebrada) e
-preserva os dois backups intactos para restauração.
+Sem `--to`, o `minor` vai para a ponta da branch (a build semanal, "5.1.7+").
+Com `--to v5.1.7`, vai para a versão oficial exata. **Para produção, use sempre
+uma tag**: a ponta da branch muda toda semana, e uma versão retirada (como a
+5.1.6, desaconselhada pela própria Moodle) nunca entra por acidente.
+
+## O que acontece num update
+
+Com o site **no ar**:
+
+1. **Pré-voo.** Containers rodando; git acessível com o dono dos arquivos;
+   remoto alcançável; destino existe, é da mesma linha e é mais novo (lido do
+   `version.php`, não do histórico do git); arquivos do core alterados (só
+   permissão é aceito e restaurado; conteúdo alterado para tudo); plugins
+   registrados sem pasta no disco; upgrade já pendente; espaço para os
+   backups. Já baixa o commit de destino. Qualquer problema aqui para o script
+   **sem** tirar o site do ar.
+
+Com o site **em manutenção**:
+
+2. **Manutenção e cron.** Liga a manutenção e pede saída graciosa (SIGTERM)
+   ao cron que já estava rodando. O laço de keepalive do cron do Moodle
+   continua executando tarefas por minutos depois que a manutenção liga; só
+   quem inicia depois disso é bloqueado.
+3. **Backup.** Banco em `pg_dump -Fc`, código inteiro menos `.git` (a v1 só
+   guardava `public/`, deixando `vendor/` e `admin/cli/` de fora) e um
+   **manifesto** com versões, commits e arquivos. Uma ref git
+   (`refs/moodle-safe-update/before-<data>`) segura o commit de antes enquanto
+   o backup existir.
+4. **Troca.** Restaura bits de permissão perdidos no core, leva a branch ao
+   destino com `git reset --keep` (funciona em clone raso e recusa apagar
+   alteração local), roda `composer install` só se o `composer.lock` mudou
+   (preservando dependências de desenvolvimento se já estavam instaladas) e o
+   `upgrade.php` com `max_input_vars` suficiente para a checagem de ambiente.
+5. **Conferências.** Limpa caches, corrige dono dos caches, confirma que não
+   sobrou upgrade pendente nem plugin sem pasta, compara o hash dos plugins
+   "sensíveis".
+6. **Volta ao ar** e confere a página de login por HTTP.
+
+Qualquer falha a partir do passo 2 deixa o site em manutenção e imprime o
+comando de rollback. Cada execução grava `backups/update-<data>.log` com o
+tempo de cada etapa.
+
+## Rollback
+
+```bash
+./update-moodle.sh rollback backups/manifest-<versão>-<data>.env
+```
+
+Volta o código ao commit de antes (mais o tar do código) e o banco ao dump.
+O banco é restaurado **num banco novo** e só no fim os nomes são trocados: o
+banco em uso não é tocado até a cópia estar completa, e fica guardado como
+`<banco>_pre_rollback_<data>` para conferência. O usuário do banco precisa de
+`CREATEDB`.
 
 ## Pré-requisitos
 
-- Um Moodle 5.x rodando via **Docker Compose**, com a estrutura de diretórios
-  do Moodle 5.x: código na raiz do repositório git, docroot em `code/public/`
-  (onde fica `version.php`), scripts CLI em `code/admin/cli/*.php`.
-- **PostgreSQL** como banco (o script usa `pg_dump`; ver [Limitações](#limitações-conhecidas)).
-- Os serviços do `docker-compose.yml` respondendo por `moodle` e `db` (ou
-  configure os nomes reais, ver [Customização](#customização)).
-- `git`, `tar`, `gzip`, `sha256sum` no host; `composer` dentro do container da aplicação.
-- O usuário que roda o script precisa de `sudo` sem senha para **apenas** os
-  comandos `git` (dentro de `code/`) e `chown` (ver [Sudoers](#sudo-com-privilégio-mínimo) abaixo) — é assim que o código é trocado por um usuário diferente do `www-data`.
-
-Layout esperado do projeto:
-
-```
-meu-moodle/
-├── docker-compose.yml
-├── .env                    # DB_NAME, DB_USER, etc. — nunca versionado
-├── code/                   # clone git do Moodle (moodle/moodle.git)
-│   ├── admin/cli/*.php
-│   └── public/             # docroot — version.php fica aqui
-├── backups/                # criado automaticamente pelo script
-└── update-moodle.sh        # este script, copiado pra dentro do projeto
-```
-
-## Instalação
-
-```bash
-cd /caminho/do/seu/projeto-moodle
-curl -fsSLO https://raw.githubusercontent.com/hellanio/moodle-safe-update/main/update-moodle.sh
-chmod +x update-moodle.sh
-```
-
-(ou clone o repositório e copie o script — o importante é que ele fique na
-raiz do seu projeto docker-compose, ao lado de `docker-compose.yml` e `code/`).
+- Moodle 5.x em Docker Compose, código do core num clone git
+  (`moodle/moodle.git`) em `code/`, docroot em `code/public/`, CLI em
+  `code/admin/cli/`. Funciona em clone raso (`--depth 1`).
+- PostgreSQL (`pg_dump`, `pg_restore`, `psql` no container do banco).
+- No host: `git`, `tar`, `curl`, `flock`, `awk`. No container da aplicação:
+  `composer`, `pgrep`, `pkill`.
+- `sudo` sem senha para os comandos abaixo.
 
 ### Sudo com privilégio mínimo
 
-O script usa `sudo` só para `git -C code/ ...` e `chown -R www-data:www-data
-code/` — porque quem troca o código precisa ser o dono dos arquivos no host,
-não o `www-data` do container. **Nunca dê `NOPASSWD: ALL`.** Restrinja aos
-comandos exatos, com o caminho absoluto do seu projeto. Exemplo
-(`/etc/sudoers.d/moodle-safe-update`, editar com `visudo -f`):
+O git e a restauração do código rodam **com o mesmo dono dos arquivos**
+(`sudo -u #<uid>`), nunca como root: rodar git como root num repositório de
+outro usuário cai no erro *dubious ownership* e ainda deixa arquivo de root no
+meio do código. A leitura para backup e as somas de verificação rodam como
+root. Exemplo para o dono uid 33 (`/etc/sudoers.d/moodle-safe-update`, editar
+com `visudo -f`):
 
 ```
-# Ajuste "hellanio" e o caminho para o seu usuario e projeto
-hellanio ALL=(root) NOPASSWD: /usr/bin/git -C /opt/moodle-docker/code *, \
-                              /usr/bin/chown -R www-data\:www-data /opt/moodle-docker/code
+hellanio ALL=(#33)  NOPASSWD: /usr/bin/git -C /opt/moodle-docker/code *, \
+                              /usr/bin/tar -C /opt/moodle-docker/code -xzf *
+hellanio ALL=(root) NOPASSWD: /usr/bin/tar -C /opt/moodle-docker/code --exclude=./.git -czf - ., \
+                              /usr/bin/du -sm --exclude=.git /opt/moodle-docker/code, \
+                              /usr/bin/find /opt/moodle-docker/code/public/*, \
+                              /usr/bin/xargs -0 sha256sum
 ```
 
-Teste com `sudo -l` (deve listar só essas duas entradas) antes de agendar o
-script sem supervisão.
+## Configuração (`.env` do projeto)
 
-## Uso
-
-### Atualização menor (patch dentro da mesma branch)
-
-Essa é a atualização "de rotina" — mesma versão maior do Moodle (ex.:
-5.1.x → 5.1.y), normalmente só correções de bug/segurança:
-
-```bash
-./update-moodle.sh minor
-```
-
-Saída típica (quando há atualização disponível):
-
-```
-[update] 2026-08-30 03:00:01 - Moodle atual: 5.1.2 (2026042101) (branch MOODLE_501_STABLE) | modo: minor
-[update] 2026-08-30 03:00:01 - Ativando modo de manutencao...
-[update] 2026-08-30 03:00:03 - Gerando backup do banco em backups/moodle-5.1.2_(2026042101)-20260830-030001.sql.gz...
-[update] 2026-08-30 03:00:47 - Backup concluido: 312M.
-[update] 2026-08-30 03:00:47 - Gerando backup do codigo em backups/code-5.1.2_(2026042101)-20260830-030001.tar.gz...
-[update] 2026-08-30 03:00:52 - Backup do codigo concluido: 89M.
-[update] 2026-08-30 03:00:52 - Buscando atualizacoes do repositorio oficial...
-[update] 2026-08-30 03:00:55 - Codigo atualizado: a1b2c3d4 -> e5f6a7b8.
-[update] 2026-08-30 03:01:10 - Atualizando dependencias do Composer...
-[update] 2026-08-30 03:01:22 - Executando upgrade do Moodle (non-interactive)...
-[update] 2026-08-30 03:01:24 - Limpando caches...
-[update] 2026-08-30 03:01:26 - OK: 'mod/attendance' permaneceu inalterado (patches locais preservados).
-[update] 2026-08-30 03:01:26 - Desativando modo de manutencao...
-[update] 2026-08-30 03:01:26 - Atualizacao concluida com sucesso: 5.1.2 (2026042101) -> 5.1.3 (2026042250).
-```
-
-Quando **não há** atualização disponível, o script encerra rápido e sem
-mexer em nada além de ligar/desligar o modo de manutenção:
-
-```
-[update] 2026-08-30 03:00:01 - Moodle atual: 5.1.3 (2026042250) (branch MOODLE_501_STABLE) | modo: minor
-[update] 2026-08-30 03:00:01 - Ativando modo de manutencao...
-[update] 2026-08-30 03:00:03 - Gerando backup do banco em backups/moodle-...sql.gz...
-[update] 2026-08-30 03:00:47 - Backup concluido: 312M.
-[update] 2026-08-30 03:00:47 - Gerando backup do codigo em backups/code-...tar.gz...
-[update] 2026-08-30 03:00:52 - Backup do codigo concluido: 89M.
-[update] 2026-08-30 03:00:52 - Buscando atualizacoes do repositorio oficial...
-[update] 2026-08-30 03:00:53 - Nenhuma atualizacao disponivel na MOODLE_501_STABLE. Desativando manutencao e saindo.
-```
-
-### Atualização maior (troca de versão)
-
-Passar de uma versão maior para outra (ex.: 5.1 → 5.2) **exige informar a
-branch de destino explicitamente** — o script nunca faz isso sozinho, porque
-é o momento de maior risco de incompatibilidade com plugins customizados:
-
-```bash
-./update-moodle.sh major MOODLE_502_STABLE
-```
-
-**Antes de rodar isso em produção:**
-1. Rode primeiro em um ambiente de homologação com uma cópia real dos dados.
-2. Confira o changelog oficial da nova versão maior (mudanças de API que quebram plugins de terceiros).
-3. Para cada plugin customizado seu, confira o campo `$plugin->supported` em `version.php` — se ele não cobrir a nova versão, o Moodle pode desativá-lo automaticamente no upgrade.
-4. Só depois disso, rode contra produção — de preferência fora do horário de pico.
-
-### Agendando via cron
-
-Atualizações menores são seguras de rodar automaticamente (patches de
-bug/segurança, sem mudança de API). Sugestão: toda madrugada de domingo.
-
-```bash
-crontab -e
-```
-
-```cron
-0 3 * * 0 /caminho/do/seu/projeto-moodle/update-moodle.sh minor >> /caminho/do/seu/projeto-moodle/backups/update.log 2>&1
-```
-
-Atualizações **maiores nunca devem ir para o cron** — rode manualmente,
-acompanhando a saída.
-
-### Rodando manualmente pela primeira vez
-
-Antes de confiar o script ao cron, rode manualmente e acompanhe a saída
-inteira pelo menos uma vez:
-
-```bash
-./update-moodle.sh minor
-echo "saida: $?"
-```
-
-Se algo falhar, o script imprime `ERRO: ...` com o motivo e qual backup usar
-para restaurar — o site fica em modo de manutenção até você resolver.
-
-## Restaurando a partir de um backup
-
-Os backups ficam em `backups/`, pareados pelo mesmo timestamp:
-- `moodle-<versao>-<timestamp>.sql.gz` — dump do banco
-- `code-<versao>-<timestamp>.tar.gz` — snapshot de `code/public/`
-
-**Restaure os dois juntos, do mesmo timestamp.** Restaurar só o banco com o
-código novo (ou vice-versa) deixa o Moodle com schema e código
-desalinhados — o `admin/cli/upgrade.php` vai reclamar de versão incompatível.
-
-```bash
-# 1. Modo de manutencao ligado (se ainda nao estiver)
-docker compose exec -T moodle su -s /bin/bash www-data -c \
-  "php8.3 /var/www/moodle/admin/cli/maintenance.php --enable"
-
-# 2. Restaurar o codigo
-sudo rm -rf code/public
-sudo tar -C code -xzf backups/code-<versao>-<timestamp>.tar.gz
-sudo chown -R www-data:www-data code/
-
-# 3. Restaurar o banco (recriando do zero)
-gunzip -c backups/moodle-<versao>-<timestamp>.sql.gz | \
-  docker compose exec -T db psql -U moodleuser -d moodle
-
-# 4. Limpar caches e desligar manutencao
-docker compose exec -T moodle su -s /bin/bash www-data -c \
-  "php8.3 /var/www/moodle/admin/cli/purge_caches.php"
-docker compose exec -T moodle su -s /bin/bash www-data -c \
-  "php8.3 /var/www/moodle/admin/cli/maintenance.php --disable"
-```
-
-## Segurança
-
-- **Sem update de core "de um clique"**, de propósito — ver [Por que este script existe](#por-que-este-script-existe).
-- `www-data` nunca tem permissão de escrita sobre o código — quem troca o
-  código é o usuário do host, via `sudo` restrito a comandos específicos
-  (nunca `NOPASSWD: ALL`).
-- Nenhuma credencial fica dentro do script — `DB_USER`/`DB_NAME` vêm do
-  `.env` do projeto, que nunca deve ser versionado.
-- `git pull --ff-only` — nunca força merge nem sobrescreve histórico
-  divergente; se não der fast-forward, o script falha em vez de arriscar um
-  merge automático.
-- Validação do nome da branch antes de usar em qualquer comando `git`
-  (defesa em profundidade contra um argumento malformado).
-- **Fail-fast em toda etapa**: qualquer comando que falhar interrompe o
-  script imediatamente, mantendo o modo de manutenção ligado e os backups
-  intactos — nunca deixa o site no ar com uma atualização pela metade.
-  (Exceção deliberada: falha no `purge_caches.php` só gera aviso, não aborta
-  — um cache desatualizado não é motivo para travar o site em manutenção.)
-- Verificação de integridade pós-update para plugins marcados como
-  "sensíveis" (forks seus que vivem dentro da árvore do core) — avisa no log
-  se o conteúdo mudou, para você conferir antes de considerar a atualização
-  concluída.
-- Recomendado: teste sempre em homologação antes de rodar contra produção,
-  especialmente em atualizações `major`.
-
-## Customização
-
-Todas as variáveis abaixo podem ir no `.env` do projeto (mesmo arquivo que
-já tem `DB_NAME`/`DB_USER`) ou ser exportadas no ambiente antes de chamar o
-script:
-
-| Variável | Default | Para que serve |
+| Variável | Padrão | Para que serve |
 |---|---|---|
-| `MOODLE_SERVICE` | `moodle` | Nome do serviço da aplicação no `docker-compose.yml` |
-| `DB_SERVICE` | `db` | Nome do serviço do banco no `docker-compose.yml` |
-| `MOODLE_CONTAINER_PATH` | `/var/www/moodle` | Docroot do Moodle **dentro** do container |
-| `SENSITIVE_PLUGINS_CSV` | *(vazio)* | Lista separada por vírgula de plugins fork-do-core a conferir após o update, ex.: `mod/attendance,local/outro` |
-| `KEEP_BACKUPS` | `14` | Quantos backups (banco + código) manter antes de apagar os mais antigos |
-| `COMPOSE` | `docker compose` | Troque para `docker-compose` se ainda usa o Compose v1 |
+| `MOODLE_SERVICE` / `DB_SERVICE` | `moodle` / `db` | Nomes dos serviços no `docker-compose.yml` |
+| `MOODLE_CONTAINER_PATH` | `/var/www/moodle` | Raiz do código **dentro** do container |
+| `WEB_USER` | `www-data` | Usuário do PHP dentro do container |
+| `PHP_VERSION` | *(vazio)* | Sufixo do binário, ex. `8.3` para `php8.3` |
+| `SENSITIVE_PLUGINS_CSV` | *(vazio)* | Forks na árvore do core a conferir, ex. `mod/attendance` |
+| `KEEP_BACKUPS` | `5` | Conjuntos de backup (banco + código + manifesto) mantidos |
+| `CLI_MAX_INPUT_VARS` | `5000` | Valor passado ao PHP de linha de comando no upgrade |
+| `CRON_WAIT` | `300` | Segundos esperando o cron em curso terminar |
+| `COMPOSE` | `docker compose` | Troque para `docker-compose` no Compose v1 |
 
-Veja `.env.example` para um modelo comentado.
+## Lições do primeiro uso real
+
+Laboratório Docker, 5.1.5+ para 5.1.7, em 19/09/2026. Cada item virou uma
+mudança no script.
+
+| O que aconteceu | Consequência na v1 | Como a v2 trata |
+|---|---|---|
+| `sudo git` num repositório de outro dono: *dubious ownership* | Falha no `git fetch` **depois** de ligar a manutenção: site fora do ar sem ter trocado nada | git com o dono dos arquivos; checado no pré-voo |
+| Sete arquivos do core sem o bit de execução (efeito de um `chmod` antigo) | Contaria como alteração local | Pré-voo separa permissão de conteúdo; restaura permissão, para em conteúdo |
+| Clone raso + buscar tag sem limite | Baixou o histórico inteiro do Moodle: `.git` de ~80 MB para 763 MB, 2 minutos | Busca só o commit de destino (`--depth=1`) |
+| Ancestralidade do git em clone raso | Falso "não é avanço rápido" depois de recortar o histórico | Segurança pelo `version.php` (mesma linha, versão maior) e troca com `reset --keep` |
+| Cron com keepalive rodando quando a manutenção liga | Tarefas rodando durante backup e upgrade | SIGTERM e espera antes do backup |
+| `composer install --no-dev` fixo | Apagaria PHPUnit e Behat de um ambiente de desenvolvimento | Preserva dependências de desenvolvimento se já existem; só roda se o lockfile mudou |
+| Rollback com `pg_restore --clean --single-transaction` em 1.634 tabelas | "sem memória compartilhada" (`max_locks_per_transaction`): código voltou, banco não | Restaura num banco novo e troca os nomes no fim |
+
+Tempos medidos no laboratório (banco de 84 a 202 MB, 24 plugins adicionais):
+update completo em 40 a 43 s, com 36 s de manutenção, dos quais 22 s de
+`upgrade.php`; rollback em 14 a 25 s.
 
 ## Limitações conhecidas
 
-- **Só PostgreSQL.** O backup usa `pg_dump`; não há suporte a
-  MySQL/MariaDB nesta versão. Se você precisar, é uma boa contribuição via PR
-  (trocar o bloco de backup por uma checagem de `DB_DRIVER`).
-- **Não verifica compatibilidade de plugins customizados** com a nova versão
-  do core antes do upgrade — isso ainda é responsabilidade sua, especialmente
-  em atualizações `major` (ver checklist na seção de uso).
-- **Não atualiza os plugins em si**, só o core do Moodle. Se você mantém
-  plugins customizados em repositórios git próprios dentro de
-  `code/public/...`, atualizá-los é um processo separado.
-- A verificação de integridade (`SENSITIVE_PLUGINS_CSV`) detecta *que* o
-  conteúdo mudou, não repara automaticamente — é um alerta para revisão
-  manual, não um mecanismo de reaplicação de patch.
+- **Só Docker Compose e git.** Um Moodle instalado direto no servidor, a
+  partir de pacote e sem git, precisa de outro modo (core novo montado ao lado,
+  com as pastas dos plugins adicionais copiadas, e troca de diretório). É o
+  próximo passo planejado.
+- **Só PostgreSQL.**
+- **Não atualiza plugins**, só o core.
+- O `check` não altera o site nem os arquivos em uso, mas grava no `.git` o
+  commit de destino que baixou.
 
 ## Licença
 
-MIT — veja [LICENSE](LICENSE). Use por sua conta e risco; teste em
-homologação antes de confiar em produção sem supervisão.
+MIT — veja [LICENSE](LICENSE). Teste em homologação antes de confiar em
+produção sem supervisão.
