@@ -51,8 +51,9 @@
 # CONFIGURACAO (env ou .env do projeto)
 #   BACKUP_DIR        onde guardar            (padrao: <projeto>/backups)
 #   KEEP_DAILY        diarios a manter        (padrao: 7)
-#   KEEP_WEEKLY       semanais a manter       (padrao: 4)
-#   WEEKLY_DOW        dia do semanal, 1=seg   (padrao: 7 = domingo)
+#   KEEP_WEEKLY       semanas a manter        (padrao: 4 — o backup mais
+#                                               recente de cada semana ISO)
+#   BACKUP_DIR        onde guardar (aponte para OUTRO DISCO, nao o dos dados)
 #   BACKUP_REMOTE     destino rsync fora do host, ex.: user@host:/backups/moodle
 #   BACKUP_REMOTE_OPTS  opcoes extras do rsync remoto (ex.: -e 'ssh -p 2222')
 #   MIN_FREE_MB       folga minima em disco   (padrao: 5120)
@@ -68,6 +69,21 @@
 # =============================================================================
 set -euo pipefail
 
+# --- Sempre como root ----------------------------------------------------------
+# Este script le o moodledata inteiro (dono: usuario do servidor web) e grava
+# arquivos com a senha do banco dentro. Rodar ora como root (pelo timer), ora
+# como uma pessoa (na mao) cria conjuntos de backup com donos misturados: o
+# manifesto que o root gravou em modo 600 depois nao podia ser lido, e o `list`
+# quebrava com "Permissao negada". Em vez de afrouxar a permissao dos arquivos,
+# padronizamos o dono: se nao for root, o script se re-executa com sudo.
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo -n -- "${BASH_SOURCE[0]}" "$@" || {
+        echo "Este script precisa de root (le o moodledata e grava a senha do banco no backup)." >&2
+        echo "Rode com sudo, ou libere sudo sem senha para ele." >&2
+        exit 1
+    }
+fi
+
 # --- Configuracao ------------------------------------------------------------
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 CODE_DIR="${CODE_DIR:-${PROJECT_DIR}/code}"
@@ -81,13 +97,12 @@ WEB_USER="${WEB_USER:-www-data}"
 CLI_MAX_INPUT_VARS="${CLI_MAX_INPUT_VARS:-5000}"
 KEEP_DAILY="${KEEP_DAILY:-7}"
 KEEP_WEEKLY="${KEEP_WEEKLY:-4}"
-WEEKLY_DOW="${WEEKLY_DOW:-7}"
 MIN_FREE_MB="${MIN_FREE_MB:-5120}"
 HTTP_WAIT="${HTTP_WAIT:-180}"   # quanto esperar o site voltar depois de uma restauracao
 
 if [ -f "${PROJECT_DIR}/.env" ]; then
     # shellcheck disable=SC1090
-    source <(grep -E '^(DB_USER|DB_NAME|MOODLE_SERVICE|DB_SERVICE|MOODLE_CONTAINER_PATH|PHP_VERSION|WEB_USER|DB_PREFIX|BACKUP_DIR|BACKUP_REMOTE|BACKUP_REMOTE_OPTS|KEEP_DAILY|KEEP_WEEKLY|WEEKLY_DOW|CLI_MAX_INPUT_VARS)=' "${PROJECT_DIR}/.env") || true
+    source <(grep -E '^(DB_USER|DB_NAME|MOODLE_SERVICE|DB_SERVICE|MOODLE_CONTAINER_PATH|PHP_VERSION|WEB_USER|DB_PREFIX|BACKUP_DIR|BACKUP_REMOTE|BACKUP_REMOTE_OPTS|KEEP_DAILY|KEEP_WEEKLY|CLI_MAX_INPUT_VARS)=' "${PROJECT_DIR}/.env") || true
 fi
 DB_USER="${DB_USER:-moodleuser}"
 DB_NAME="${DB_NAME:-moodle}"
@@ -208,7 +223,6 @@ load_manifest() {
 preflight() {
     step "Pre-voo"
     command -v rsync >/dev/null || fail "rsync nao encontrado no host."
-    sudo -n true 2>/dev/null || fail "Este script precisa de sudo sem senha (le moodledata, que e do usuario do servidor web)."
     dc ps --status running --services 2>/dev/null | grep -qx "${DB_SERVICE}" \
         || fail "Servico '${DB_SERVICE}' nao esta rodando."
     dc exec -T "${DB_SERVICE}" pg_isready -U "${DB_USER}" -d "${DB_NAME}" >/dev/null \
@@ -218,7 +232,7 @@ preflight() {
 
     mkdir -p "${BACKUP_DIR}/data"
     # O backup guarda o config.php (com a senha do banco) e todo dado de usuario.
-    chmod 700 "${BACKUP_DIR}" 2>/dev/null || true
+    sudo -n chmod 700 "${BACKUP_DIR}" 2>/dev/null || true
 
     local free_mb; free_mb=$(df -Pm "${BACKUP_DIR}" | awk 'NR==2{print $4}')
     [ "${free_mb}" -ge "${MIN_FREE_MB}" ] \
@@ -240,7 +254,7 @@ do_run() {
     step "Banco (pg_dump -Fc)"
     dc exec -T "${DB_SERVICE}" pg_dump -U "${DB_USER}" -Fc -Z 6 "${DB_NAME}" > "${db_dump}" \
         || { rm -f "${db_dump}"; fail "pg_dump falhou."; }
-    chmod 600 "${db_dump}"
+    sudo -n chmod 600 "${db_dump}"
     log "Banco: $(human "${db_dump}") (${db_dump##*/})"
 
     # 2) moodledata incremental por hardlink contra o snapshot anterior.
@@ -264,7 +278,7 @@ do_run() {
     # shellcheck disable=SC2024
     sudo -n tar -C "${CODE_DIR}" --exclude=./.git -czf - . > "${code_tar}" \
         || { rm -f "${code_tar}"; fail "Backup do codigo falhou."; }
-    chmod 600 "${code_tar}"
+    sudo -n chmod 600 "${code_tar}"
     log "Codigo: $(human "${code_tar}") (${code_tar##*/})"
 
     # 4) Manifesto.
@@ -275,6 +289,7 @@ do_run() {
 BK_STAMP=${STAMP}
 BK_DAY=${DAYSTAMP}
 BK_DOW=$(date '+%u')
+BK_WEEK=$(date '+%G-%V')
 BK_RELEASE='${release}'
 BK_DB_NAME=${DB_NAME}
 BK_DB_DUMP=${db_dump}
@@ -284,7 +299,7 @@ BK_DATA_SNAP=${data_snap}
 # O 'verify' restaura o dump e confere contra estes numeros.
 BK_CENSUS='${census_before}'
 EOF
-    chmod 600 "${manifest}"
+    sudo -n chmod 644 "${manifest}"  # sem segredo dentro; o dump e o tar e que ficam 600
     log "Manifesto: ${manifest##*/}  (censo ${census_before})"
 
     do_prune
@@ -299,11 +314,23 @@ EOF
 copy_remote() {
     step "Copia para fora do host"
     if [ -z "${BACKUP_REMOTE}" ]; then
-        warn "BACKUP_REMOTE nao configurado: o backup esta SO neste host. Backup no mesmo disco nao protege contra a falha mais comum, que e o disco. Configure BACKUP_REMOTE no .env (ex.: BACKUP_REMOTE=user@host:/backups/moodle)."
+        # Mesmo dispositivo que os dados = o backup morre junto com o disco.
+        # Dispositivo diferente ja cobre a falha mais comum; sobra o risco do
+        # host inteiro (incendio, furto, ransomware), que e outra conversa.
+        local devdata devbk
+        devdata=$(stat -c '%d' "${DATA_DIR}" 2>/dev/null || echo x)
+        devbk=$(stat -c '%d' "${BACKUP_DIR}" 2>/dev/null || echo y)
+        if [ "${devdata}" = "${devbk}" ]; then
+            warn "BACKUP_REMOTE nao configurado E o backup esta NO MESMO DISCO dos dados (${BACKUP_DIR}). Uma falha de disco leva os dois juntos. Aponte BACKUP_DIR para outro disco, ou configure BACKUP_REMOTE."
+        else
+            log "Sem copia fora do host. O backup esta noutro disco ($(df -h --output=source "${BACKUP_DIR}" | tail -1 | tr -d ' ')), o que cobre falha de disco — mas nao incendio, furto ou ransomware. Para isso, configure BACKUP_REMOTE."
+        fi
         return 0
     fi
+    # -H e obrigatorio aqui: sem ele o rsync DESFAZ os hardlinks entre os snapshots
+    # e cada um volta a ocupar o tamanho cheio no destino, anulando o --link-dest.
     # shellcheck disable=SC2086
-    if sudo -n rsync -a --delete ${BACKUP_REMOTE_OPTS} "${BACKUP_DIR}/" "${BACKUP_REMOTE%/}/"; then
+    if sudo -n rsync -aH --delete ${BACKUP_REMOTE_OPTS} "${BACKUP_DIR}/" "${BACKUP_REMOTE%/}/"; then
         log "Enviado para ${BACKUP_REMOTE}."
     else
         warn "A copia para ${BACKUP_REMOTE} FALHOU. O backup local ficou de pe, mas fora do host nao ha copia desta execucao."
@@ -320,14 +347,26 @@ do_prune() {
     # Os KEEP_DAILY mais recentes ficam, sempre.
     while IFS= read -r m; do keep+=("${m}"); done < <(echo "${all}" | head -n "${KEEP_DAILY}")
 
-    # Alem deles, os KEEP_WEEKLY mais recentes tirados no dia da semana escolhido.
-    local weekly=0
+    # Semanais: o backup MAIS RECENTE de cada semana ISO distinta, ate KEEP_WEEKLY
+    # semanas. Antes isto era "os que cairam no domingo", e tinha dois furos:
+    # varios backups no mesmo domingo (o do timer mais um na mao) comiam varios
+    # slots semanais de uma vez, encurtando a retencao em silencio; e uma maquina
+    # desligada no domingo ficava sem cobertura daquela semana. Semana ISO nao
+    # depende de nenhum backup cair num dia especifico.
+    local weekly=0 seen_weeks=" " wk
     while IFS= read -r m; do
         [ "${weekly}" -ge "${KEEP_WEEKLY}" ] && break
-        local dow; dow=$(grep -oP '^BK_DOW=\K.*' "${m}" 2>/dev/null || echo 0)
-        if [ "${dow}" = "${WEEKLY_DOW}" ] && ! printf '%s\n' "${keep[@]}" | grep -qxF "${m}"; then
-            keep+=("${m}"); weekly=$(( weekly + 1 ))
+        wk=$(grep -oP '^BK_WEEK=\K.*' "${m}" 2>/dev/null || true)
+        if [ -z "${wk}" ]; then
+            # Manifesto anterior a esta versao: deduz a semana do carimbo.
+            local d; d=$(grep -oP '^BK_DAY=\K.*' "${m}" 2>/dev/null || true)
+            [ -n "${d}" ] && wk=$(date -d "${d}" '+%G-%V' 2>/dev/null || true)
         fi
+        [ -n "${wk}" ] || continue
+        case "${seen_weeks}" in *" ${wk} "*) continue ;; esac
+        seen_weeks="${seen_weeks}${wk} "
+        weekly=$(( weekly + 1 ))
+        printf '%s\n' "${keep[@]}" | grep -qxF "${m}" || keep+=("${m}")
     done < <(echo "${all}")
 
     local removed=0
@@ -335,9 +374,9 @@ do_prune() {
         printf '%s\n' "${keep[@]}" | grep -qxF "${m}" && continue
         # shellcheck disable=SC1090
         ( source "${m}"
-          rm -f "${BK_DB_DUMP}" "${BK_CODE_TAR}"
+          sudo -n rm -f "${BK_DB_DUMP}" "${BK_CODE_TAR}"
           [ -n "${BK_DATA_SNAP:-}" ] && sudo -n rm -rf "${BK_DATA_SNAP}"
-          rm -f "${m}" ) || warn "Falha ao remover o conjunto ${m##*/}"
+          sudo -n rm -f "${m}" ) || warn "Falha ao remover o conjunto ${m##*/}"
         removed=$(( removed + 1 ))
         log "Removido: ${m##*/}"
     done < <(echo "${all}")
@@ -359,6 +398,7 @@ do_list() {
         found=1
     done < <(ls -1t "${BACKUP_DIR}"/manifest-*.env 2>/dev/null)
     [ "${found}" = 1 ] || echo "Nenhum backup em ${BACKUP_DIR}."
+    echo "Guardados em: ${BACKUP_DIR} ($(df -h --output=source,size,avail "${BACKUP_DIR}" 2>/dev/null | tail -1 | tr -s ' '))"
     [ -n "${BACKUP_REMOTE}" ] && echo "Copia fora do host: ${BACKUP_REMOTE}" || echo "Copia fora do host: NAO CONFIGURADA (BACKUP_REMOTE)"
 }
 

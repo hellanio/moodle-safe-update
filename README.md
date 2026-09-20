@@ -181,6 +181,28 @@ entrou no `update-moodle.sh`).
 
 Sinalizadores: `--db-only`, `--no-data`, `--no-code`.
 
+### Retenção
+
+`KEEP_DAILY` conjuntos mais recentes, mais o backup **mais recente de cada uma
+das últimas `KEEP_WEEKLY` semanas ISO**. Semana ISO, e não "o que caiu no
+domingo", porque a versão por dia da semana tinha dois furos: dois backups no
+mesmo domingo (o do timer mais um rodado na mão) consumiam dois slots semanais
+e encurtavam a retenção em silêncio; e uma máquina desligada no domingo ficava
+sem cobertura nenhuma daquela semana.
+
+Apagar um snapshot antigo não afeta os outros: o arquivo só some do disco
+quando o último hardlink que aponta para ele vai embora.
+
+### Roda como root, sempre
+
+Se não for root, o script **se re-executa com `sudo`**. Ele lê o `moodledata`
+inteiro (dono: o usuário do servidor web) e grava arquivos com a senha do banco
+dentro — e, mais prático que isso: rodar ora pelo timer (root), ora na mão
+(você) criava conjuntos com donos misturados, e o manifesto gravado pelo root
+em modo 600 depois não podia ser lido, quebrando até o `list`. Padronizar o
+dono resolve a classe inteira de problema. Dump e tar ficam `600`; o manifesto,
+que não guarda segredo, fica `644`.
+
 ### Cópia fora do host
 
 Backup no mesmo disco não protege contra a falha mais comum, que é o disco.
@@ -208,8 +230,7 @@ Só do `backup-moodle.sh`:
 | `BACKUP_DIR` | `<projeto>/backups` | Onde os conjuntos são guardados |
 | `BACKUP_REMOTE` | *(vazio)* | Destino rsync fora do host. Vazio = aviso em toda execução |
 | `BACKUP_REMOTE_OPTS` | *(vazio)* | Opções extras do rsync remoto, ex. `-e 'ssh -p 2222'` |
-| `KEEP_DAILY` / `KEEP_WEEKLY` | `7` / `4` | Conjuntos diários e semanais mantidos |
-| `WEEKLY_DOW` | `7` | Dia da semana do "semanal" (1 = segunda) |
+| `KEEP_DAILY` / `KEEP_WEEKLY` | `7` / `4` | Conjuntos diários, e semanas ISO das quais se guarda o backup mais recente |
 | `DB_PREFIX` | `mdl_` | Prefixo das tabelas, usado pelo censo do `verify` |
 | `MIN_FREE_MB` | `5120` | Folga mínima em disco exigida no pré-voo |
 | `HTTP_WAIT` | `180` | Segundos esperando o site voltar depois de restaurar |
@@ -261,6 +282,9 @@ ficaram intactos.
 |---|---|
 | Depois do `docker start`, o entrypoint reaplica permissões na árvore inteira do código antes de subir o nginx. O `docker exec` já respondia, e o script concluía que o site não tinha subido — **falso negativo numa restauração correta** | `wait_for_http` insiste até `HTTP_WAIT` segundos, em vez de checar uma vez |
 | `code=$(curl -w '%{http_code}' ... \|\| echo 000)` imprimia `000000` quando o curl falhava: as duas saídas se juntavam | O status vem só do `curl`; o erro é tratado à parte |
+| Backup rodado pelo timer (root) e depois na mão (usuário): o manifesto em modo 600 do root não podia ser lido, e o `list` morria com "Permissão negada" | O script se re-executa com `sudo`; dono sempre uniforme |
+| Retenção por "dia da semana": cinco backups no mesmo domingo ocuparam os quatro slots semanais e **nada foi podado** | Retenção por semana ISO: o mais recente de cada semana |
+| `rsync` para o destino remoto sem `-H` desfaria todos os hardlinks: 7 snapshots de 436 MB virariam 3 GB no destino | `rsync -aH` |
 
 ## Licença
 
