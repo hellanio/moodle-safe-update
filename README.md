@@ -1,8 +1,13 @@
 # moodle-safe-update
 
-Atualização segura do Moodle 5.x rodando em Docker Compose, com pré-voo antes
-de tirar o site do ar, backup completo com manifesto, rollback de um comando e
-conferências depois do upgrade.
+Dois scripts para operar um Moodle 5.x em Docker Compose sem sustos:
+
+- **`update-moodle.sh`** — atualização segura do core, com pré-voo antes de
+  tirar o site do ar, backup completo com manifesto, rollback de um comando e
+  conferências depois do upgrade.
+- **`backup-moodle.sh`** — o backup de todo dia, com snapshot incremental do
+  `moodledata`, verificação automática do dump e restauração sem ponto sem
+  volta. Veja [Backup diário](#backup-diário-backup-moodlesh).
 
 **Versão 2 (2026-09-19).** Reescrita depois do primeiro uso real, que levou um
 laboratório de 5.1.5+ para 5.1.7 e mostrou sete problemas na versão 1 (ver
@@ -109,6 +114,79 @@ hellanio ALL=(root) NOPASSWD: /usr/bin/tar -C /opt/moodle-docker/code --exclude=
                               /usr/bin/xargs -0 sha256sum
 ```
 
+## Backup diário (`backup-moodle.sh`)
+
+O `update-moodle.sh` tira **um** backup antes de mexer no core. Este é a rotina
+de todo dia — e, diferente dele, sabe restaurar sozinho.
+
+```bash
+./backup-moodle.sh run                  # tira um backup. É o comando do cron
+./backup-moodle.sh list                 # o que está guardado
+./backup-moodle.sh verify               # prova o backup mais recente, sem tocar no site
+./backup-moodle.sh restore <manifesto>  # restauração de verdade; pede confirmação
+./backup-moodle.sh prune                # só aplica a retenção
+```
+
+```cron
+0 3 * * * /opt/moodle/backup-moodle.sh run    >> /var/log/moodle-backup.log 2>&1
+0 4 * * * /opt/moodle/backup-moodle.sh verify >> /var/log/moodle-backup.log 2>&1
+```
+
+### O que entra, e o que não entra
+
+| Parte | Como | Por quê |
+|---|---|---|
+| Banco | `pg_dump -Fc -Z 6` | Formato custom: comprimido e restaurável seletivamente. Consistente sozinho (snapshot MVCC), então **não é preciso tirar o site do ar** |
+| `moodledata` | `rsync --link-dest` do snapshot anterior | O `filedir` do Moodle é imutável (arquivo nomeado pelo hash do conteúdo): o que não mudou vira hardlink e custa zero. Um `moodledata` de 50 GB rende um snapshot diário do tamanho do que entrou naquele dia |
+| Código | `tar.gz` sem `.git` | Carrega o `config.php` e os plugins — o que o git do core não guarda |
+| ~~cache, localcache, temp, trashdir, sessões~~ | excluídos | Regeneráveis; só engordariam o backup e a restauração |
+
+O `muc/` **fica**: guarda a configuração dos armazenamentos de cache, não os
+dados.
+
+### A ordem importa
+
+O banco é copiado **antes** dos arquivos. O Moodle nunca apaga um arquivo do
+`filedir` na hora (vai para o `trashdir` e só o cron remove depois), então todo
+arquivo citado pelo dump ainda existe quando o rsync passa. Na ordem inversa,
+um arquivo enviado no meio do backup entraria no banco e ficaria fora da
+cópia — e viraria um anexo quebrado na restauração.
+
+### Um backup que nunca foi restaurado não é um backup
+
+Por isso o `verify` existe e é feito para rodar no cron. Ele:
+
+1. cria um banco descartável e roda `pg_restore` nele — se o dump estiver
+   truncado, você descobre hoje, não no dia do desastre;
+2. compara um **censo** (nº de tabelas, usuários, cursos e a `version` do
+   Moodle) gravado no manifesto no momento do dump com o mesmo censo no banco
+   restaurado;
+3. testa a integridade do `tar.gz` com `gzip -t`;
+4. apaga o banco descartável, aconteça o que acontecer.
+
+Nada disso toca o banco em uso: dá para rodar com o site no ar.
+
+### Restauração sem ponto sem volta
+
+Nada é sobrescrito no lugar:
+
+- o banco é restaurado num banco **novo** e só então os nomes são trocados
+  (`ALTER DATABASE RENAME`); o anterior fica como `<banco>_pre_restore_<data>`;
+- o `moodledata` atual é **movido para o lado** antes de o snapshot entrar.
+
+Se a restauração der errado, os dois voltam com um `rename`. Restaurar por cima
+com `pg_restore --clean --single-transaction` num Moodle real estoura o
+`max_locks_per_transaction` — são milhares de tabelas (foi assim que a lição
+entrou no `update-moodle.sh`).
+
+Sinalizadores: `--db-only`, `--no-data`, `--no-code`.
+
+### Cópia fora do host
+
+Backup no mesmo disco não protege contra a falha mais comum, que é o disco.
+Configure `BACKUP_REMOTE` (destino rsync, ex. `user@host:/backups/moodle`).
+Enquanto estiver vazio, **toda execução avisa**.
+
 ## Configuração (`.env` do projeto)
 
 | Variável | Padrão | Para que serve |
@@ -122,6 +200,19 @@ hellanio ALL=(root) NOPASSWD: /usr/bin/tar -C /opt/moodle-docker/code --exclude=
 | `CLI_MAX_INPUT_VARS` | `5000` | Valor passado ao PHP de linha de comando no upgrade |
 | `CRON_WAIT` | `300` | Segundos esperando o cron em curso terminar |
 | `COMPOSE` | `docker compose` | Troque para `docker-compose` no Compose v1 |
+
+Só do `backup-moodle.sh`:
+
+| Variável | Padrão | Para que serve |
+|---|---|---|
+| `BACKUP_DIR` | `<projeto>/backups` | Onde os conjuntos são guardados |
+| `BACKUP_REMOTE` | *(vazio)* | Destino rsync fora do host. Vazio = aviso em toda execução |
+| `BACKUP_REMOTE_OPTS` | *(vazio)* | Opções extras do rsync remoto, ex. `-e 'ssh -p 2222'` |
+| `KEEP_DAILY` / `KEEP_WEEKLY` | `7` / `4` | Conjuntos diários e semanais mantidos |
+| `WEEKLY_DOW` | `7` | Dia da semana do "semanal" (1 = segunda) |
+| `DB_PREFIX` | `mdl_` | Prefixo das tabelas, usado pelo censo do `verify` |
+| `MIN_FREE_MB` | `5120` | Folga mínima em disco exigida no pré-voo |
+| `HTTP_WAIT` | `180` | Segundos esperando o site voltar depois de restaurar |
 
 ## Lições do primeiro uso real
 
@@ -152,6 +243,24 @@ update completo em 40 a 43 s, com 36 s de manutenção, dos quais 22 s de
 - **Não atualiza plugins**, só o core.
 - O `check` não altera o site nem os arquivos em uso, mas grava no `.git` o
   commit de destino que baixou.
+- O `backup-moodle.sh` **não** usa a API de backup do Moodle: ele copia banco e
+  arquivos. Serve para levantar o site inteiro de volta, não para mover um curso
+  de uma instalação para outra — para isso existe o backup nativo (`.mbz`).
+- A restauração do `moodledata` troca o diretório inteiro. Se a sua instalação
+  aponta o `dataroot` para um volume nomeado do Docker (e não um bind mount),
+  adapte o passo — o script assume um diretório no host.
+
+## Lições da primeira restauração testada
+
+Testada no mesmo laboratório, em 20/09/2026, com marcadores criados de
+propósito depois do backup (um curso e um arquivo no `dataroot`) para provar
+que a restauração de fato volta o estado — os dois sumiram, e os dados reais
+ficaram intactos.
+
+| O que aconteceu | Como o script trata |
+|---|---|
+| Depois do `docker start`, o entrypoint reaplica permissões na árvore inteira do código antes de subir o nginx. O `docker exec` já respondia, e o script concluía que o site não tinha subido — **falso negativo numa restauração correta** | `wait_for_http` insiste até `HTTP_WAIT` segundos, em vez de checar uma vez |
+| `code=$(curl -w '%{http_code}' ... \|\| echo 000)` imprimia `000000` quando o curl falhava: as duas saídas se juntavam | O status vem só do `curl`; o erro é tratado à parte |
 
 ## Licença
 
